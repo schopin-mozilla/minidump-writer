@@ -401,6 +401,10 @@ impl<'a> ProcessReader<'a> {
     pub fn read_at(&self, address: usize, buf: &mut [u8]) -> Result<usize> {
         self.0.read_at(address, buf).map_err(Error::ProcessReader)
     }
+
+    pub fn read_pod<T: process_reader::Plain>(&self, address: usize) -> Result<T> {
+        self.0.read_pod(address).map_err(Error::ProcessReaderExact)
+    }
 }
 
 /// This is just a typesafe wrapper around ptrace(), which is vararg... But this is Rust, and
