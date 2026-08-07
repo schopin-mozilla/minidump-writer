@@ -2,8 +2,25 @@
 
 use std::{
     ffi::{OsStr, OsString},
+    os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
 };
+
+use super::{
+    Pid,
+    process_inspection::process_reader::{CopyFromProcessError, ProcessReader},
+};
+use elf::{
+    dynamic::{DT_DEBUG, DT_LOOS, Dyn},
+    header::{ELFMAG, ET_DYN, Header as ElfHeader},
+    program_header::{PF_X, PT_DYNAMIC, PT_LOAD, PT_PHDR, ProgramHeader},
+};
+use plain::Plain;
+
+#[cfg(not(target_pointer_width = "64"))]
+use goblin::elf32 as elf;
+#[cfg(target_pointer_width = "64")]
+use goblin::elf64 as elf;
 
 use crate::{
     linux::process_inspection::ProcessInspector,
@@ -39,6 +56,103 @@ pub enum ModuleResolveError {
         base_address: usize,
         code_end: usize,
         clamped_to: usize,
+    },
+}
+
+/// Shared object loading information for the debugger
+///
+/// The Linux dynamic linker fills this info in the Dynamic section of the ELF headers at
+/// runtime. It is known as the "debugger rendez-vous" point and is a legacy structure to assist
+/// debuggers in locating loaded shared modules.
+///
+/// (But we're going to use it for minidump generation purposes.)
+///
+/// <https://sourceware.org/git/?p=glibc.git;a=blob;f=elf/link.h;h=b645760402514c4839686aaeade20dd5bb7725dd;hb=HEAD#l40>
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Debug)]
+struct r_debug {
+    /// Version number of the protocol
+    r_version: std::ffi::c_int,
+    /// Address of the first link_map structure
+    r_map: usize,
+    /// Address of callback function for module map/unmap
+    r_brk: usize,
+    /// Argument to r_brk on whether mapping is being added, subtracted, or is done
+    r_state: std::ffi::c_int,
+    /// Base address the linker is loaded at
+    r_ldbase: usize,
+}
+
+/// Information for a single dynamically loaded module
+///
+/// This structure contains important information about a dynamically-loaded module, like its
+/// name and virtual address. It is also a node in a doubly-linked list of such modules.
+///
+/// <https://sourceware.org/git/?p=glibc.git;a=blob;f=elf/link.h;h=b645760402514c4839686aaeade20dd5bb7725dd;hb=HEAD#l101>
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Debug)]
+struct link_map {
+    /// Difference between the addresses in the ELF file and the addresses in memory
+    l_addr: usize,
+    /// Name of file for module
+    l_name: usize,
+    /// Address of the Dynamic section
+    l_ld: usize,
+    /// Address of next node in list
+    l_next: usize,
+    /// Address of previous node in list
+    l_prev: usize,
+}
+
+unsafe impl Plain for link_map {}
+unsafe impl Plain for r_debug {}
+
+/// Errors that prevent the debugger rendez-vous from being walked at all.
+///
+/// Failures that only affect a single module are reported as soft errors
+/// instead, so that one unreadable object doesn't cost us the whole list.
+#[derive(Debug, thiserror::Error, serde::Serialize)]
+pub enum DebuggerRendezvousError {
+    #[error("failed to read program header table")]
+    ReadProgramHeaderTableFailed(#[source] CopyFromProcessError),
+    #[error("program header table missing self-pointer")]
+    ProgramHeaderTableNoSelf,
+    #[error("program header table missing dynamic section")]
+    ProgramHeaderTableNoDynamic,
+    #[error("program header table has no loadable segment")]
+    ProgramHeaderTableNoLoad,
+    #[error("failed to read ELF header")]
+    ReadElfHeaderFailed(#[source] CopyFromProcessError),
+    #[error("ELF header had invalid identifer bytes: `{0:?}`")]
+    InvalidElfSignature([u8; 4]),
+    #[error("unexpected size for dynamic section `{0}`")]
+    InvalidDynamicSectionSize(usize),
+    #[error("dynamic section missing NULL entry")]
+    DynamicSectionMissingTerminator,
+    #[error("failed to read dynamic section")]
+    ReadDynamicSectionFailed(#[source] CopyFromProcessError),
+    #[error("failed to find DT_DEBUG entry in dynamic section")]
+    MissingDebugEntry,
+    #[error("failed to read debugger rendezvous address")]
+    ReadDebuggerRendezvousAddressFailed(#[source] CopyFromProcessError),
+    #[error("unexpected debugger rendezvous version '{0}'")]
+    UnexpectedDebuggerRendezvousVersion(i32),
+    #[error("an error occurred iterating the link_map linked list")]
+    IterateLinkMapFailed(#[source] Box<DebuggerRendezvousError>),
+    #[error("failed reading link_map entry")]
+    ReadLinkMapEntryFailed(#[source] CopyFromProcessError),
+    #[error("invalid link entry")]
+    InvalidLinkEntry,
+    #[error("failed reading module name")]
+    ReadModuleNameFailed(#[source] CopyFromProcessError),
+    #[error("skipping module `{}` at {address:#x}", name.to_string_lossy())]
+    SkippedModule {
+        name: OsString,
+        address: usize,
+        #[source]
+        source: Box<DebuggerRendezvousError>,
     },
 }
 
@@ -508,5 +622,434 @@ mod tests {
             let actual = SoVersion::parse(OsStr::new(path)).unwrap();
             assert_eq!(actual, expected);
         }
+    }
+}
+
+/// Derives the module list by walking the dynamic linker's debugger rendez-vous.
+///
+/// The debugger rendez-vous is reachable through a field in the main program's
+/// headers, hence the need for `process_inspector`, `program_header_table_address`
+/// and `program_header_count`, while `pid` is there in order to get a name for the
+/// main program's module, which isn't necessarily given in the DT_DEBUG data (glibc).
+pub fn from_debugger_rendezvous(
+    process_inspector: &ProcessInspector,
+    pid: Pid,
+    program_header_table_address: usize,
+    program_header_count: usize,
+    mut soft_errors: impl WriteErrorList<DebuggerRendezvousError>,
+) -> Result<Vec<ModuleCandidate>, DebuggerRendezvousError> {
+    let memory_reader = process_inspector.process_reader();
+
+    let program_headers = read_program_headers(
+        &memory_reader,
+        program_header_table_address,
+        program_header_count,
+    )?;
+
+    // PT_PHDR gives the program header table's own virtual address, so the
+    // difference between it and the address the kernel actually put the table at
+    // is where the main executable's ELF header lives.
+    let program_header_table_virtual_address = find_segment(&program_headers, PT_PHDR)
+        .ok_or(DebuggerRendezvousError::ProgramHeaderTableNoSelf)?
+        .0;
+    let elf_header_address = program_header_table_address - program_header_table_virtual_address;
+
+    // Let's make sure we can locate and parse the ELF header to ensure we didn't somehow read garbage.
+    read_elf_header(&memory_reader, elf_header_address)?;
+
+    let (dynamic_segment_virtual_address, dynamic_segment_size) =
+        find_segment(&program_headers, PT_DYNAMIC)
+            .ok_or(DebuggerRendezvousError::ProgramHeaderTableNoDynamic)?;
+    let dynamic_segment_address = elf_header_address + dynamic_segment_virtual_address;
+
+    let dynamic_section = read_dynamic_section(
+        &memory_reader,
+        dynamic_segment_address,
+        dynamic_segment_size,
+    )?;
+
+    let debugger_rendezvous_address = get_rendezvous_address(&dynamic_section)?;
+    let debugger_rendezvous =
+        read_debugger_rendezvous(&memory_reader, debugger_rendezvous_address)?;
+
+    read_link_map(
+        process_inspector,
+        &memory_reader,
+        pid,
+        debugger_rendezvous.r_map,
+        elf_header_address,
+        &mut soft_errors,
+    )
+    .map_err(|e| DebuggerRendezvousError::IterateLinkMapFailed(Box::new(e)))
+}
+
+fn read_program_headers(
+    memory_reader: &ProcessReader<'_>,
+    program_header_table_address: usize,
+    program_header_count: usize,
+) -> Result<Vec<ProgramHeader>, DebuggerRendezvousError> {
+    memory_reader
+        .read_pod_vec(program_header_table_address, program_header_count)
+        .map_err(DebuggerRendezvousError::ReadProgramHeaderTableFailed)
+}
+
+/// Returns the virtual address and in-memory size of the first segment of the
+/// given type, if the program header table has one.
+fn find_segment(program_headers: &[ProgramHeader], segment_type: u32) -> Option<(usize, usize)> {
+    program_headers
+        .iter()
+        .find(|hdr| hdr.p_type == segment_type)
+        .map(|hdr| {
+            (
+                usize::try_from(hdr.p_vaddr).unwrap(),
+                usize::try_from(hdr.p_memsz).unwrap(),
+            )
+        })
+}
+
+fn read_elf_header(
+    memory_reader: &ProcessReader<'_>,
+    elf_header_address: usize,
+) -> Result<ElfHeader, DebuggerRendezvousError> {
+    let elf_header: ElfHeader = memory_reader
+        .read_pod(elf_header_address)
+        .map_err(DebuggerRendezvousError::ReadElfHeaderFailed)?;
+
+    let signature: [u8; 4] = elf_header.e_ident[0..4].try_into().unwrap();
+    if &signature != ELFMAG {
+        return Err(DebuggerRendezvousError::InvalidElfSignature(signature));
+    }
+
+    Ok(elf_header)
+}
+
+fn read_dynamic_section(
+    memory_reader: &ProcessReader<'_>,
+    dynamic_segment_address: usize,
+    dynamic_segment_size: usize,
+) -> Result<Vec<Dyn>, DebuggerRendezvousError> {
+    // Check that the dynamic section size is a multiple of the size of a dynamic entry
+    if !dynamic_segment_size.is_multiple_of(std::mem::size_of::<Dyn>()) {
+        return Err(DebuggerRendezvousError::InvalidDynamicSectionSize(
+            dynamic_segment_size,
+        ));
+    }
+
+    let dynamic_section = memory_reader
+        .read_pod_vec(
+            dynamic_segment_address,
+            dynamic_segment_size / std::mem::size_of::<Dyn>(),
+        )
+        .map_err(DebuggerRendezvousError::ReadDynamicSectionFailed)?;
+
+    if dynamic_section.last() != Some(&Dyn::default()) {
+        return Err(DebuggerRendezvousError::DynamicSectionMissingTerminator);
+    }
+
+    Ok(dynamic_section)
+}
+
+// `d_tag` is already a `u64` on 64-bit targets, but a `u32` on 32-bit ones,
+// where the conversion is what makes the comparison compile.
+#[allow(clippy::useless_conversion)]
+fn get_rendezvous_address(dynamic_section: &[Dyn]) -> Result<usize, DebuggerRendezvousError> {
+    dynamic_section
+        .iter()
+        .find_map(|d| (u64::from(d.d_tag) == DT_DEBUG).then_some(d.d_val))
+        .map(|a| usize::try_from(a).unwrap())
+        .ok_or(DebuggerRendezvousError::MissingDebugEntry)
+}
+
+fn read_debugger_rendezvous(
+    memory_reader: &ProcessReader<'_>,
+    debugger_rendezvous_address: usize,
+) -> Result<r_debug, DebuggerRendezvousError> {
+    let debugger_rendezvous: r_debug = memory_reader
+        .read_pod(debugger_rendezvous_address)
+        .map_err(DebuggerRendezvousError::ReadDebuggerRendezvousAddressFailed)?;
+    if debugger_rendezvous.r_version != 1 {
+        return Err(
+            DebuggerRendezvousError::UnexpectedDebuggerRendezvousVersion(
+                debugger_rendezvous.r_version,
+            ),
+        );
+    }
+    Ok(debugger_rendezvous)
+}
+
+fn read_c_string(
+    memory_reader: &ProcessReader<'_>,
+    address: usize,
+) -> Result<OsString, DebuggerRendezvousError> {
+    let mut buf = Vec::new();
+    memory_reader
+        .read_until(address, 0, &mut buf)
+        .map_err(DebuggerRendezvousError::ReadModuleNameFailed)?;
+    if buf.last() == Some(&0) {
+        buf.pop();
+    }
+    Ok(OsString::from_vec(buf))
+}
+
+fn read_link_map(
+    process_inspector: &ProcessInspector,
+    memory_reader: &ProcessReader<'_>,
+    pid: Pid,
+    link_map_address: usize,
+    main_executable_elf_header_address: usize,
+    mut soft_errors: impl WriteErrorList<DebuggerRendezvousError>,
+) -> Result<Vec<ModuleCandidate>, DebuggerRendezvousError> {
+    let page_size = page_size();
+    let mut link_maps = LinkMaps::new(link_map_address);
+
+    let mut result: Vec<ModuleCandidate> = Vec::new();
+
+    // The head of the list is the main executable, which gets special treatment
+    // twice over: we already know where its ELF header is from `AT_PHDR` (which
+    // matters under glibc, where `l_addr` is a load *bias* and so is zero for a
+    // non-PIE executable rather than the header's address), and glibc leaves its
+    // `l_name` empty. Both fixups are no-ops under bionic, which fills in the
+    // full path and has rejected non-PIE executables since API 21.
+    let mut main_executable = true;
+
+    while let Some(link) = link_maps.next(memory_reader)? {
+        let elf_header_address = if main_executable {
+            main_executable_elf_header_address
+        } else {
+            link.l_addr
+        };
+
+        let module = read_c_string(memory_reader, link.l_name)
+            .map(|name| {
+                if main_executable && name.is_empty() {
+                    // Let's try asking /proc/pid/exe
+                    main_executable_name(process_inspector, pid)
+                } else {
+                    Some(name)
+                }
+            })
+            .and_then(|name| {
+                read_module(
+                    memory_reader,
+                    &name,
+                    elf_header_address,
+                    link.l_addr,
+                    page_size,
+                )
+                .map_err(|e| DebuggerRendezvousError::SkippedModule {
+                    name: name.unwrap_or_default(),
+                    address: elf_header_address,
+                    source: Box::new(e),
+                })
+            });
+
+        main_executable = false;
+
+        // One unreadable object shouldn't cost us the rest of the list.
+        match module {
+            Ok(module) => result.push(module),
+            Err(e) => soft_errors.push(e),
+        }
+    }
+
+    Ok(result)
+}
+
+/// Reads a single module out of its program header table.
+///
+/// A module is one entry, spanning all of its `PT_LOAD` segments. Overlap with
+/// other entries of the module list is resolved afterwards, once the whole list
+/// is known.
+fn read_module(
+    memory_reader: &ProcessReader<'_>,
+    name: &Option<OsString>,
+    elf_header_address: usize,
+    load_bias: usize,
+    page_size: usize,
+) -> Result<ModuleCandidate, DebuggerRendezvousError> {
+    let elf_header = read_elf_header(memory_reader, elf_header_address)?;
+
+    let program_header_address = elf_header_address + usize::try_from(elf_header.e_phoff).unwrap();
+    let program_header_count = usize::from(elf_header.e_phnum);
+
+    let program_headers =
+        read_program_headers(memory_reader, program_header_address, program_header_count)?;
+
+    // `p_vaddr` is relative to the module's load bias, which is zero for a
+    // non-PIE main executable and the load address for everything else.
+    let mut segments: Vec<Segment> = program_headers
+        .iter()
+        .filter(|hdr| hdr.p_type == PT_LOAD)
+        .map(|hdr| {
+            let start = load_bias + usize::try_from(hdr.p_vaddr).unwrap();
+            let end = start + usize::try_from(hdr.p_memsz).unwrap();
+            // Round out to whole pages, since that's the granularity the kernel
+            // actually mapped the segment at.
+            Segment {
+                start: align_down(start, page_size),
+                end: align_up(end, page_size),
+                file_offset: align_down(usize::try_from(hdr.p_offset).unwrap(), page_size),
+                executable: hdr.p_flags & PF_X != 0,
+            }
+        })
+        .collect();
+    segments.sort_by_key(|segment| segment.start);
+
+    let first = segments
+        .first()
+        .ok_or(DebuggerRendezvousError::ProgramHeaderTableNoLoad)?;
+
+    // A module spans all of its segments, holes included. Whether a hole
+    // belongs to the object isn't knowable from here -- the dynamic linker
+    // reserves the whole range and pads the holes with PROT_NONE, while the
+    // kernel, which maps the main executable and the interpreter, leaves them
+    // unmapped -- and covering one costs nothing on its own. What must not
+    // happen is a module swallowing another entry of the module list, and that
+    // is resolved once the whole list is known, not here.
+    let end_address = segments.iter().map(|segment| segment.end).max().unwrap();
+
+    let base_address = base_address(
+        memory_reader,
+        &elf_header,
+        &program_headers,
+        load_bias,
+        first.start,
+    );
+
+    Ok(ModuleCandidate {
+        base_address,
+        end_address,
+        code_end: segments
+            .iter()
+            .filter(|segment| segment.executable)
+            .map(|segment| segment.end)
+            .max()
+            .unwrap_or(first.start),
+        name: name.clone(),
+        file_offset: first.file_offset,
+        source: ModuleSource::Process,
+    })
+}
+
+/// Get the base address of a given, that is the address against which all
+/// addresses in a module are resolved.
+fn base_address(
+    memory_reader: &ProcessReader<'_>,
+    elf_header: &ElfHeader,
+    program_headers: &[ProgramHeader],
+    load_bias: usize,
+    lowest_segment_start: usize,
+) -> usize {
+    // It's usually the start of the lowest segment, except for shared libraries
+    // that use Android packed relocations (according to the Breakpad sources)
+    if lowest_segment_start != load_bias
+        && elf_header.e_type == ET_DYN
+        && has_packed_relocations(memory_reader, program_headers, load_bias)
+    {
+        load_bias
+    } else {
+        lowest_segment_start
+    }
+}
+
+/// Whether the object carries Android's packed relocation tags.
+#[allow(clippy::useless_conversion)]
+fn has_packed_relocations(
+    memory_reader: &ProcessReader<'_>,
+    program_headers: &[ProgramHeader],
+    load_bias: usize,
+) -> bool {
+    const DT_ANDROID_REL: u64 = DT_LOOS + 2;
+    const DT_ANDROID_RELA: u64 = DT_LOOS + 4;
+
+    let Some((vaddr, size)) = find_segment(program_headers, PT_DYNAMIC) else {
+        return false;
+    };
+    let Ok(dynamic_section) = read_dynamic_section(memory_reader, load_bias + vaddr, size) else {
+        return false;
+    };
+
+    dynamic_section.iter().any(|d| {
+        let tag = u64::from(d.d_tag);
+        tag == DT_ANDROID_REL || tag == DT_ANDROID_RELA
+    })
+}
+
+/// One `PT_LOAD` segment, as the kernel would have mapped it.
+#[derive(Debug)]
+struct Segment {
+    start: usize,
+    end: usize,
+    file_offset: usize,
+    executable: bool,
+}
+
+fn main_executable_name(process_inspector: &ProcessInspector, pid: Pid) -> Option<OsString> {
+    process_inspector
+        .read_link(format!("/proc/{pid}/exe").into())
+        .map(PathBuf::into_os_string)
+        .inspect_err(|e| {
+            log::warn!("failed to read /proc/{pid}/exe for the main executable's name: {e}");
+        })
+        .ok()
+}
+
+fn page_size() -> usize {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    assert!(
+        page_size > 0,
+        "somehow we weren't able to get the page size"
+    );
+    usize::try_from(page_size).unwrap()
+}
+
+fn align_down(val: usize, align: usize) -> usize {
+    val / align * align
+}
+
+fn align_up(val: usize, align: usize) -> usize {
+    let result = val / align * align;
+    if !val.is_multiple_of(align) {
+        result + align
+    } else {
+        result
+    }
+}
+
+#[derive(Debug)]
+struct LinkMaps {
+    address: usize,
+    first_node: bool,
+}
+
+impl LinkMaps {
+    fn new(first_address: usize) -> LinkMaps {
+        LinkMaps {
+            address: first_address,
+            first_node: true,
+        }
+    }
+
+    fn next(
+        &mut self,
+        memory_reader: &ProcessReader<'_>,
+    ) -> Result<Option<link_map>, DebuggerRendezvousError> {
+        if self.address == 0 {
+            return Ok(None);
+        }
+
+        let link: link_map = memory_reader
+            .read_pod(self.address)
+            .map_err(DebuggerRendezvousError::ReadLinkMapEntryFailed)?;
+        if self.first_node {
+            if link.l_prev != 0 {
+                return Err(DebuggerRendezvousError::InvalidLinkEntry);
+            }
+            self.first_node = false;
+        }
+
+        self.address = link.l_next;
+
+        Ok(Some(link))
     }
 }
