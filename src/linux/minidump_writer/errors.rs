@@ -12,7 +12,7 @@ use {
             thread_list_stream::SectionThreadListError,
             thread_names_stream::SectionThreadNamesError,
         },
-        module_list::ModuleResolveError,
+        module_list::{DebuggerRendezvousError, ModuleResolveError},
         module_reader::ModuleReaderError,
         process_inspection,
         serializers::*,
@@ -185,6 +185,14 @@ pub enum InitError {
     SuspendNoThreadsLeft(usize),
     #[error("Crash thread does not reference principal mapping")]
     PrincipalMappingNotReferenced,
+    #[error("no program header table address in auxiliary vector")]
+    MissingProgramHeaderTableAddress,
+    #[error("no program header count in auxiliary vector")]
+    MissingProgramHeaderCount,
+    #[error("failed to obtain the module list from the debugger rendez-vous")]
+    ModuleListFromDebuggerRendezvousFailed(#[source] DebuggerRendezvousError),
+    #[error("Errors occurred while walking the debugger rendez-vous")]
+    DebuggerRendezvousErrors(#[source] ErrorList<DebuggerRendezvousError>),
 }
 
 #[derive(Debug, thiserror::Error, serde::Serialize)]
