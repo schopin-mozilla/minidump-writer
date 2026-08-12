@@ -613,6 +613,58 @@ mod tests {
         );
     }
 
+    /// A `PT_PHDR` as the linker lays one out: the table follows the ELF
+    /// header, so it sits at file offset 0x40 and `p_vaddr` is wherever that
+    /// offset landed in the address space.
+    fn program_header_table_at(virtual_address: u64) -> ProgramHeader {
+        ProgramHeader {
+            p_type: PT_PHDR,
+            p_offset: 0x40,
+            p_vaddr: virtual_address,
+            ..Default::default()
+        }
+    }
+
+    /// A PIE is loaded wherever the kernel likes, so its bias is that address
+    /// and its ELF header is right at the bottom of the object.
+    #[test]
+    fn locates_a_pie_main_executable() {
+        let program_headers = [program_header_table_at(0x40)];
+
+        let located = MainExecutable::locate(&program_headers, 0xaaaa_0040).unwrap();
+
+        assert_eq!(located.load_bias, 0xaaaa_0000);
+        assert_eq!(located.elf_header_address, 0xaaaa_0000);
+    }
+
+    /// A non-PIE executable is loaded at the absolute addresses in its own
+    /// headers, so nothing moved and the bias is zero -- but the ELF header is
+    /// still up at the link address. Deriving one from the other reads address
+    /// zero and fails the walk, dropping us to the memory map for a whole class
+    /// of executables.
+    #[test]
+    fn locates_a_non_pie_main_executable() {
+        let program_headers = [program_header_table_at(0x40_0040)];
+
+        let located = MainExecutable::locate(&program_headers, 0x40_0040).unwrap();
+
+        assert_eq!(located.load_bias, 0);
+        assert_eq!(located.elf_header_address, 0x40_0000);
+    }
+
+    #[test]
+    fn cannot_locate_a_main_executable_without_pt_phdr() {
+        let program_headers = [ProgramHeader {
+            p_type: PT_LOAD,
+            ..Default::default()
+        }];
+
+        assert!(matches!(
+            MainExecutable::locate(&program_headers, 0x40_0040),
+            Err(DebuggerRendezvousError::ProgramHeaderTableNoSelf)
+        ));
+    }
+
     #[test]
     fn test_elf_file_so_version() {
         #[rustfmt::skip]
@@ -662,21 +714,15 @@ pub fn from_debugger_rendezvous(
         program_header_count,
     )?;
 
-    // PT_PHDR gives the program header table's own virtual address, so the
-    // difference between it and the address the kernel actually put the table at
-    // is where the main executable's ELF header lives.
-    let program_header_table_virtual_address = find_segment(&program_headers, PT_PHDR)
-        .ok_or(DebuggerRendezvousError::ProgramHeaderTableNoSelf)?
-        .0;
-    let elf_header_address = program_header_table_address - program_header_table_virtual_address;
+    let main_executable = MainExecutable::locate(&program_headers, program_header_table_address)?;
 
     // Let's make sure we can locate and parse the ELF header to ensure we didn't somehow read garbage.
-    read_elf_header(&memory_reader, elf_header_address)?;
+    read_elf_header(&memory_reader, main_executable.elf_header_address)?;
 
     let (dynamic_segment_virtual_address, dynamic_segment_size) =
         find_segment(&program_headers, PT_DYNAMIC)
             .ok_or(DebuggerRendezvousError::ProgramHeaderTableNoDynamic)?;
-    let dynamic_segment_address = elf_header_address + dynamic_segment_virtual_address;
+    let dynamic_segment_address = main_executable.load_bias + dynamic_segment_virtual_address;
 
     let dynamic_section = read_dynamic_section(
         &memory_reader,
@@ -693,10 +739,50 @@ pub fn from_debugger_rendezvous(
         &memory_reader,
         pid,
         debugger_rendezvous.r_map,
-        elf_header_address,
+        main_executable.elf_header_address,
         &mut soft_errors,
     )
     .map_err(|e| DebuggerRendezvousError::IterateLinkMapFailed(Box::new(e)))
+}
+
+/// Where the main executable is, worked out from its program header table.
+#[derive(Debug, PartialEq, Eq)]
+struct MainExecutable {
+    /// How far the object moved from the addresses in its headers: the load
+    /// address of a PIE, and zero for a non-PIE, which is loaded exactly where
+    /// it was linked. Program header virtual addresses are relative to this.
+    load_bias: usize,
+    /// Where the ELF header itself ended up.
+    elf_header_address: usize,
+}
+
+impl MainExecutable {
+    /// `PT_PHDR` describes the program header table itself, so comparing it
+    /// against the address the kernel actually put the table at -- `AT_PHDR`,
+    /// here `program_header_table_address` -- locates the rest of the object.
+    ///
+    /// Both answers come from that one comparison, but from different fields,
+    /// and they are only the same number for a PIE. The header sits at file
+    /// offset 0, so `AT_PHDR - p_offset` finds it; the bias is what the
+    /// virtual addresses moved by, so `AT_PHDR - p_vaddr` gives that. For a
+    /// non-PIE executable the bias is zero while the header is up at its
+    /// absolute link address, and deriving one from the other would have us
+    /// read address zero.
+    fn locate(
+        program_headers: &[ProgramHeader],
+        program_header_table_address: usize,
+    ) -> Result<Self, DebuggerRendezvousError> {
+        let table = program_headers
+            .iter()
+            .find(|hdr| hdr.p_type == PT_PHDR)
+            .ok_or(DebuggerRendezvousError::ProgramHeaderTableNoSelf)?;
+
+        Ok(Self {
+            load_bias: program_header_table_address - usize::try_from(table.p_vaddr).unwrap(),
+            elf_header_address: program_header_table_address
+                - usize::try_from(table.p_offset).unwrap(),
+        })
+    }
 }
 
 fn read_program_headers(
