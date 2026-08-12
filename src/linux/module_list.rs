@@ -28,6 +28,7 @@ use crate::{
     module_reader::ModuleReaderError,
 };
 use error_graph::WriteErrorList;
+use failspot::failspot;
 
 use super::maps_reader::MappingInfo;
 
@@ -109,6 +110,16 @@ struct link_map {
 unsafe impl Plain for link_map {}
 unsafe impl Plain for r_debug {}
 
+/// `r_debug::r_state`: the mapping change is complete, so the link map can be
+/// trusted.
+///
+/// The linker moves `r_state` to `RT_ADD` (1) or `RT_DELETE` (2) before it
+/// starts mutating the list and back to `RT_CONSISTENT` once it is done,
+/// calling `r_brk` at each transition so that a debugger can observe them.
+///
+/// <https://sourceware.org/git/?p=glibc.git;a=blob;f=elf/link.h;h=b645760402514c4839686aaeade20dd5bb7725dd;hb=HEAD#l52>
+const RT_CONSISTENT: std::ffi::c_int = 0;
+
 /// Errors that prevent the debugger rendez-vous from being walked at all.
 ///
 /// Failures that only affect a single module are reported as soft errors
@@ -139,6 +150,11 @@ pub enum DebuggerRendezvousError {
     ReadDebuggerRendezvousAddressFailed(#[source] CopyFromProcessError),
     #[error("unexpected debugger rendezvous version '{0}'")]
     UnexpectedDebuggerRendezvousVersion(i32),
+    #[error(
+        "the dynamic linker was mid-update (r_state = {0}), so its list of \
+         modules cannot be trusted"
+    )]
+    DebuggerRendezvousNotConsistent(i32),
     #[error("an error occurred iterating the link_map linked list")]
     IterateLinkMapFailed(#[source] Box<DebuggerRendezvousError>),
     #[error("failed reading link_map entry")]
@@ -774,6 +790,22 @@ fn read_debugger_rendezvous(
             ),
         );
     }
+
+    // `dlopen`/`dlclose` are exactly when the linker is rewriting the list, so
+    // a crash taken during one can find it half-linked: an entry spliced in but
+    // not yet filled, or unmapped but not yet unlinked. Walking that either
+    // fails per-module -- which we would report as a soft error and carry on
+    // from, quietly short an entry -- or, worse, succeeds and yields a module
+    // list that is silently wrong.
+    //
+    // Refusing here sends the caller to `/proc/<pid>/maps`, which the kernel
+    // keeps consistent whatever the linker is in the middle of.
+    if debugger_rendezvous.r_state != RT_CONSISTENT || failspot!(DebuggerRendezvousNotConsistent) {
+        return Err(DebuggerRendezvousError::DebuggerRendezvousNotConsistent(
+            debugger_rendezvous.r_state,
+        ));
+    }
+
     Ok(debugger_rendezvous)
 }
 
