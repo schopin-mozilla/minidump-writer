@@ -258,8 +258,10 @@ impl MinidumpWriter {
         let stack_copy = failspot!(if ThreadStackCopy {
             Err(CopyFromProcessError::InvalidArgument)
         } else {
-            MinidumpWriter::copy_from_process(
+            // Read until we hit a guard page
+            MinidumpWriter::read_until_guard(
                 self.process_inspector.as_ref(),
+                self.page_size,
                 valid_stack_ptr,
                 stack_len,
             )
