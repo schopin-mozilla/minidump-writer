@@ -561,14 +561,14 @@ impl Drop for AckReceiver {
     fn drop(&mut self) {
         // SAFETY: syscall
         unsafe {
-            mach_port::mach_port_deallocate(mach_task_self(), self.port);
+            mach_port::mach_port_destruct(mach_task_self(), self.port, -1, /*guard*/ 0);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Server, kern_return_t, port};
+    use super::{AckReceiver, Server, kern_return_t, port};
     use mach2::{
         kern_return::{KERN_INVALID_NAME, KERN_SUCCESS},
         traps::mach_task_self,
@@ -599,6 +599,37 @@ mod tests {
 
         drop(server);
 
+        assert_eq!(
+            unsafe {
+                mach_port_get_refs(task, port, port::MACH_PORT_RIGHT_RECEIVE, &mut references)
+            },
+            KERN_INVALID_NAME
+        );
+    }
+
+    #[test]
+    fn ack_receiver_drop_releases_port_name() {
+        let receiver = unsafe { AckReceiver::new() }.expect("failed to create ack receiver");
+        let task = unsafe { mach_task_self() };
+        let port = receiver.port;
+        let mut references = 0;
+
+        assert_eq!(
+            unsafe {
+                mach_port_get_refs(task, port, port::MACH_PORT_RIGHT_RECEIVE, &mut references)
+            },
+            KERN_SUCCESS
+        );
+        assert_eq!(references, 1);
+        assert_eq!(
+            unsafe { mach_port_get_refs(task, port, port::MACH_PORT_RIGHT_SEND, &mut references) },
+            KERN_SUCCESS
+        );
+        assert_eq!(references, 1);
+
+        drop(receiver);
+
+        // KERN_INVALID_NAME only happens if *all* rights have been dropped.
         assert_eq!(
             unsafe {
                 mach_port_get_refs(task, port, port::MACH_PORT_RIGHT_RECEIVE, &mut references)
